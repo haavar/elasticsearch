@@ -537,16 +537,6 @@ public class CompositeRolesStoreTests extends ESTestCase {
         Consumer<ActionListener<RoleRetrievalResult>> rolesHandler,
         Consumer<ActionListener<Collection<ApplicationPrivilegeDescriptor>>> privilegesHandler
     ) {
-        return setupRolesStore(settings, threadContext, EsExecutors.DIRECT_EXECUTOR_SERVICE, rolesHandler, privilegesHandler);
-    }
-
-    private CompositeRolesStore setupRolesStore(
-        Settings settings,
-        ThreadContext threadContext,
-        Executor completionExecutor,
-        Consumer<ActionListener<RoleRetrievalResult>> rolesHandler,
-        Consumer<ActionListener<Collection<ApplicationPrivilegeDescriptor>>> privilegesHandler
-    ) {
         // Control async callbacks without starting security-index or file-watcher infrastructure.
         final FileRolesStore fileRolesStore = mock(FileRolesStore.class);
         doCallRealMethod().when(fileRolesStore).accept(anySet(), anyActionListener());
@@ -581,7 +571,6 @@ public class CompositeRolesStoreTests extends ESTestCase {
             buildBitsetCache(),
             TestRestrictedIndices.RESTRICTED_INDICES,
             mockRoleBuildingExecutor,
-            completionExecutor,
             descriptors -> {},
             List.of()
         );
@@ -912,22 +901,31 @@ public class CompositeRolesStoreTests extends ESTestCase {
         }
     }
 
-    /** Pending subscribers use the executor; completed cache hits remain inline. */
-    public void testSharedRoleLookupDispatchesSubscribers() {
+    /** Callbacks run inline on cache hits and on the completing thread for pending loads. */
+    public void testSharedRoleLookupCompletesSubscribersInline() {
         for (boolean failLoad : new boolean[] { false, true }) {
-            final List<Runnable> completions = new ArrayList<>();
             final AtomicReference<ActionListener<RoleRetrievalResult>> retrieval = new AtomicReference<>();
             final CompositeRolesStore store = setupRolesStore(
                 SECURITY_ENABLED_SETTINGS,
                 new ThreadContext(SECURITY_ENABLED_SETTINGS),
-                completions::add,
                 retrieval::set,
                 listener -> fail("unexpected application privileges")
             );
             final PlainActionFuture<Role> first = new PlainActionFuture<>();
             final PlainActionFuture<Role> second = new PlainActionFuture<>();
-            getRoleForRoleNames(store, Set.of("shared-role"), first);
-            getRoleForRoleNames(store, Set.of("shared-role"), second);
+            final Thread completingThread = Thread.currentThread();
+            final AtomicReference<Thread> firstThread = new AtomicReference<>();
+            final AtomicReference<Thread> secondThread = new AtomicReference<>();
+            getRoleForRoleNames(
+                store,
+                Set.of("shared-role"),
+                ActionListener.runBefore(first, () -> firstThread.set(Thread.currentThread()))
+            );
+            getRoleForRoleNames(
+                store,
+                Set.of("shared-role"),
+                ActionListener.runBefore(second, () -> secondThread.set(Thread.currentThread()))
+            );
             final IllegalStateException failure = new IllegalStateException("role retrieval failed");
             if (failLoad) {
                 retrieval.get().onFailure(failure);
@@ -940,10 +938,10 @@ public class CompositeRolesStoreTests extends ESTestCase {
                 getRoleForRoleNames(store, Set.of("shared-role"), cached);
                 assertTrue(cached.isDone());
             }
-            assertFalse(first.isDone());
-            assertFalse(second.isDone());
-            assertThat(completions, hasSize(2));
-            completions.forEach(Runnable::run);
+            assertTrue(first.isDone());
+            assertTrue(second.isDone());
+            assertSame(completingThread, firstThread.get());
+            assertSame(completingThread, secondThread.get());
             if (failLoad) {
                 assertSame(failure, expectThrows(IllegalStateException.class, first::actionGet));
                 assertSame(failure, expectThrows(IllegalStateException.class, second::actionGet));
@@ -1163,7 +1161,6 @@ public class CompositeRolesStoreTests extends ESTestCase {
             buildBitsetCache(),
             TestRestrictedIndices.RESTRICTED_INDICES,
             EsExecutors.DIRECT_EXECUTOR_SERVICE,
-            EsExecutors.DIRECT_EXECUTOR_SERVICE,
             mock(),
             List.of()
         );
@@ -1240,7 +1237,6 @@ public class CompositeRolesStoreTests extends ESTestCase {
             TestProjectResolvers.singleProject(projectId),
             documentSubsetBitsetCache,
             TestRestrictedIndices.RESTRICTED_INDICES,
-            EsExecutors.DIRECT_EXECUTOR_SERVICE,
             EsExecutors.DIRECT_EXECUTOR_SERVICE,
             effectiveRoleDescriptors::set,
             List.of()
@@ -2007,7 +2003,6 @@ public class CompositeRolesStoreTests extends ESTestCase {
             buildBitsetCache(),
             TestRestrictedIndices.RESTRICTED_INDICES,
             mockRoleBuildingExecutor,
-            EsExecutors.DIRECT_EXECUTOR_SERVICE,
             rds -> {},
             providers
         );
@@ -4413,7 +4408,6 @@ public class CompositeRolesStoreTests extends ESTestCase {
             buildBitsetCache(),
             TestRestrictedIndices.RESTRICTED_INDICES,
             EsExecutors.DIRECT_EXECUTOR_SERVICE,
-            EsExecutors.DIRECT_EXECUTOR_SERVICE,
             rds -> {},
             List.of()
         );
@@ -4531,7 +4525,6 @@ public class CompositeRolesStoreTests extends ESTestCase {
             TestProjectResolvers.singleProject(randomProjectIdOrDefault()),
             buildBitsetCache(),
             TestRestrictedIndices.RESTRICTED_INDICES,
-            EsExecutors.DIRECT_EXECUTOR_SERVICE,
             EsExecutors.DIRECT_EXECUTOR_SERVICE,
             rds -> {},
             List.of()
@@ -5332,7 +5325,6 @@ public class CompositeRolesStoreTests extends ESTestCase {
             documentSubsetBitsetCache,
             TestRestrictedIndices.RESTRICTED_INDICES,
             mockRoleBuildingExecutor,
-            EsExecutors.DIRECT_EXECUTOR_SERVICE,
             roleConsumer,
             List.of()
         ) {

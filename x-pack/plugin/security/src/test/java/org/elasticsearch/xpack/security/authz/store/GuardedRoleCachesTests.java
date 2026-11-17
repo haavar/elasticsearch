@@ -10,14 +10,19 @@ import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.support.PlainActionFuture;
 import org.elasticsearch.action.support.SubscribableListener;
 import org.elasticsearch.cluster.metadata.ProjectId;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.util.concurrent.ThreadContext;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xpack.core.security.authz.permission.Role;
 import org.elasticsearch.xpack.core.security.authz.store.RoleKey;
 import org.elasticsearch.xpack.core.security.test.TestRestrictedIndices;
 import org.elasticsearch.xpack.security.authz.store.GuardedRoleCaches.RoleLoadResult;
 
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -37,32 +42,34 @@ public class GuardedRoleCachesTests extends ESTestCase {
 
     /** Pending resolutions share a listener, including across unrelated invalidations. */
     public void testPendingRoleSurvivesUnrelatedInvalidation() {
-        final GuardedRoleCaches caches = new GuardedRoleCaches(UNBOUNDED, UNBOUNDED);
+        final GuardedRoleCaches caches = newCaches(UNBOUNDED, UNBOUNDED);
         final ProjectId project = randomUniqueProjectId();
         final PendingRoleLoad pending = startRoleLoad(caches, project, R1);
-        assertSame(pending.listener(), caches.getOrLoadRole(project, R1, listener -> fail("load is already registered")));
+        final SubscribableListener<Role> cachedListener = caches.getRole(project, R1);
+        caches.getOrLoadRole(project, R1, listener -> fail("load is already registered"), ActionListener.noop());
 
         caches.invalidateRole(project, "unrelated");
-        assertSame(pending.listener(), caches.getRole(project, R1));
+        assertSame(cachedListener, caches.getRole(project, R1));
         assertFalse(pending.listener().isDone());
 
         pending.completion().onResponse(new RoleLoadResult(Role.EMPTY, Set.of("missing"), true));
         assertFalse(caches.isKnownMissing(project, "missing"));
-        assertSame(pending.listener(), caches.getRole(project, R1));
+        assertSame(cachedListener, caches.getRole(project, R1));
         assertInternedKeysMatchCachedRoles(caches, 1);
     }
 
     /** Old completions cannot remove a replacement listener or its interned key. */
     public void testConditionalRemovalKeepsReplacement() {
-        final GuardedRoleCaches caches = new GuardedRoleCaches(UNBOUNDED, UNBOUNDED);
+        final GuardedRoleCaches caches = newCaches(UNBOUNDED, UNBOUNDED);
         final ProjectId project = randomUniqueProjectId();
         final PendingRoleLoad old = startRoleLoad(caches, project, R1);
         caches.invalidateRole(project, "r1");
         assertInternedKeysMatchCachedRoles(caches, 0);
 
         final PendingRoleLoad replacement = startRoleLoad(caches, project, R1);
+        final SubscribableListener<Role> cachedListener = caches.getRole(project, R1);
         old.completion().onFailure(new IllegalStateException("old load failed"));
-        assertSame(replacement.listener(), caches.getRole(project, R1));
+        assertSame(cachedListener, caches.getRole(project, R1));
         assertInternedKeysMatchCachedRoles(caches, 1);
 
         replacement.completion().onResponse(new RoleLoadResult(Role.EMPTY, Set.of(), false));
@@ -70,7 +77,7 @@ public class GuardedRoleCachesTests extends ESTestCase {
     }
 
     public void testWriteWithUnchangedGenerationIsCachedAndServed() {
-        final GuardedRoleCaches caches = new GuardedRoleCaches(UNBOUNDED, UNBOUNDED);
+        final GuardedRoleCaches caches = newCaches(UNBOUNDED, UNBOUNDED);
         final ProjectId project = randomUniqueProjectId();
         assertThat(caches.getRole(project, R1_R2), nullValue());
         final SubscribableListener<Role> role = cacheRole(caches, project, R1_R2, role("r1", "r2"), Set.of("m1"));
@@ -86,29 +93,39 @@ public class GuardedRoleCachesTests extends ESTestCase {
     }
 
     public void testConcurrentLookupsShareFirstLoad() {
-        final GuardedRoleCaches caches = new GuardedRoleCaches(UNBOUNDED, UNBOUNDED);
+        final GuardedRoleCaches caches = newCaches(UNBOUNDED, UNBOUNDED);
         final ProjectId project = randomUniqueProjectId();
         assertThat(caches.getRole(project, R1), nullValue());
         final PendingRoleLoad first = startRoleLoad(caches, project, R1);
-        assertSame(first.listener(), caches.getOrLoadRole(project, roleKey("r1"), listener -> fail("duplicate load")));
+        final PlainActionFuture<Role> joined = new PlainActionFuture<>();
+        caches.getOrLoadRole(project, roleKey("r1"), listener -> fail("duplicate load"), joined);
+        assertFalse(joined.isDone());
 
         final Role role = role("r1");
         first.completion().onResponse(new RoleLoadResult(role, Set.of(), true));
-        assertSame(first.listener(), caches.getOrLoadRole(project, R1, listener -> fail("role is already cached")));
+        final PlainActionFuture<Role> hit = new PlainActionFuture<>();
+        caches.getOrLoadRole(project, R1, listener -> fail("role is already cached"), hit);
+        assertTrue(hit.isDone());
+        assertSame(role, hit.actionGet());
+        assertSame(role, joined.actionGet());
         assertSame(role, roleResult(first.listener()));
     }
 
     /** Cache updates finish before subscribers can retry or inspect missing roles. */
     public void testCacheUpdatesBeforeNotifyingSubscribers() {
         for (boolean cacheable : new boolean[] { true, false }) {
-            final GuardedRoleCaches caches = new GuardedRoleCaches(UNBOUNDED, UNBOUNDED);
+            final GuardedRoleCaches caches = newCaches(UNBOUNDED, UNBOUNDED);
             final ProjectId project = randomUniqueProjectId();
             final PendingRoleLoad pending = startRoleLoad(caches, project, R1);
             final PlainActionFuture<Role> subscriber = new PlainActionFuture<>();
             pending.listener().addListener(subscriber.delegateFailureAndWrap((listener, role) -> {
                 assertFalse(Thread.holdsLock(caches));
                 assertEquals(cacheable, caches.isKnownMissing(project, "missing"));
-                assertSame(cacheable ? pending.listener() : null, caches.getRole(project, R1));
+                if (cacheable) {
+                    assertSame(role, roleResult(caches.getRole(project, R1)));
+                } else {
+                    assertNull(caches.getRole(project, R1));
+                }
                 listener.onResponse(role);
             }));
 
@@ -122,7 +139,7 @@ public class GuardedRoleCachesTests extends ESTestCase {
     public void testNegativeCacheIndependentOfRoleEviction() {
         for (int maximumRoles : new int[] { 0, 1 }) {
             for (boolean invalidate : new boolean[] { true, false }) {
-                final GuardedRoleCaches caches = new GuardedRoleCaches(maximumRoles, UNBOUNDED);
+                final GuardedRoleCaches caches = newCaches(maximumRoles, UNBOUNDED);
                 final ProjectId project = randomUniqueProjectId();
                 final PendingRoleLoad pending = startRoleLoad(caches, project, R1);
                 cacheRole(caches, project, R2, role("r2"), Set.of());
@@ -141,18 +158,70 @@ public class GuardedRoleCachesTests extends ESTestCase {
     }
 
     public void testSynchronousLoaderFailureIsNotCached() {
-        final GuardedRoleCaches caches = new GuardedRoleCaches(UNBOUNDED, UNBOUNDED);
+        final GuardedRoleCaches caches = newCaches(UNBOUNDED, UNBOUNDED);
         final ProjectId project = randomUniqueProjectId();
         final IllegalStateException failure = new IllegalStateException("load failed");
-        final SubscribableListener<Role> failed = caches.getOrLoadRole(project, R1, listener -> {
+        final SubscribableListener<Role> failed = new SubscribableListener<>();
+        caches.getOrLoadRole(project, R1, listener -> {
             assertFalse(Thread.holdsLock(caches));
             throw failure;
-        });
+        }, failed);
 
         assertNull(caches.getRole(project, R1));
         assertSame(failure, expectThrows(IllegalStateException.class, () -> roleResult(failed)));
         assertInternedKeysMatchCachedRoles(caches, 0);
         assertNotNull(cacheRole(caches, project, R1, role("r1"), Set.of()));
+    }
+
+    /** Shared work drops caller headers; each subscriber completes in its own context. */
+    public void testSharedLoadPreservesSubscriberContexts() {
+        final ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
+        for (boolean failLoad : new boolean[] { true, false }) {
+            final GuardedRoleCaches caches = new GuardedRoleCaches(UNBOUNDED, UNBOUNDED, threadContext);
+            final ProjectId project = randomUniqueProjectId();
+            final AtomicReference<ActionListener<RoleLoadResult>> load = new AtomicReference<>();
+            final List<PlainActionFuture<Role>> subscribers = new ArrayList<>();
+            for (String caller : List.of("first", "second")) {
+                try (ThreadContext.StoredContext ignored = threadContext.newEmptyContext()) {
+                    threadContext.putHeader("request", caller);
+                    threadContext.addResponseHeader("response", caller);
+                    final PlainActionFuture<Role> subscriber = new PlainActionFuture<>();
+                    subscribers.add(subscriber);
+                    caches.getOrLoadRole(project, R1, listener -> {
+                        assertFalse(Thread.holdsLock(caches));
+                        assertNull(threadContext.getHeader("request"));
+                        assertEquals(Map.of(), threadContext.getResponseHeaders());
+                        assertTrue(load.compareAndSet(null, listener));
+                    }, ActionListener.runBefore(subscriber, () -> {
+                        assertFalse(Thread.holdsLock(caches));
+                        assertEquals(caller, threadContext.getHeader("request"));
+                        assertEquals(Map.of("response", List.of(caller)), threadContext.getResponseHeaders());
+                    }));
+                    assertEquals(caller, threadContext.getHeader("request"));
+                }
+            }
+            final Role role = role("r1");
+            final IllegalStateException failure = new IllegalStateException("load failed");
+            try (ThreadContext.StoredContext ignored = threadContext.newEmptyContext()) {
+                threadContext.putHeader("request", "completer");
+                threadContext.addResponseHeader("response", "completer");
+                if (failLoad) {
+                    load.get().onFailure(failure);
+                } else {
+                    load.get().onResponse(new RoleLoadResult(role, Set.of("missing"), true));
+                }
+                subscribers.forEach(subscriber -> assertTrue(subscriber.isDone()));
+                assertEquals("completer", threadContext.getHeader("request"));
+                assertEquals(Map.of("response", List.of("completer")), threadContext.getResponseHeaders());
+            }
+            for (PlainActionFuture<Role> subscriber : subscribers) {
+                if (failLoad) {
+                    assertSame(failure, expectThrows(IllegalStateException.class, subscriber::actionGet));
+                } else {
+                    assertSame(role, subscriber.actionGet());
+                }
+            }
+        }
     }
 
     // Every kind of invalidation must move the generation of the project it affects. One case per kind so that a failure
@@ -193,7 +262,7 @@ public class GuardedRoleCachesTests extends ESTestCase {
     }
 
     private static void assertWriteAfterInvalidationIsRejected(BiConsumer<GuardedRoleCaches, ProjectId> invalidation) {
-        final GuardedRoleCaches caches = new GuardedRoleCaches(UNBOUNDED, UNBOUNDED);
+        final GuardedRoleCaches caches = newCaches(UNBOUNDED, UNBOUNDED);
         final ProjectId project = randomUniqueProjectId();
 
         final PendingRoleLoad pending = startRoleLoad(caches, project, R1);
@@ -219,13 +288,14 @@ public class GuardedRoleCachesTests extends ESTestCase {
     }
 
     private static void assertWriteAfterInvalidationOfAnotherProjectIsAccepted(BiConsumer<GuardedRoleCaches, ProjectId> invalidation) {
-        final GuardedRoleCaches caches = new GuardedRoleCaches(UNBOUNDED, UNBOUNDED);
+        final GuardedRoleCaches caches = newCaches(UNBOUNDED, UNBOUNDED);
         final ProjectId project = randomUniqueProjectId();
         final ProjectId otherProject = randomUniqueProjectId();
         final PendingRoleLoad pending = startRoleLoad(caches, project, R1);
         invalidation.accept(caches, otherProject);
         pending.completion().onResponse(new RoleLoadResult(role("r1"), Set.of("m1"), true));
-        assertSame(pending.listener(), caches.getRole(project, R1));
+        assertNotNull(caches.getRole(project, R1));
+        assertSame(roleResult(pending.listener()), roleResult(caches.getRole(project, R1)));
         assertTrue(caches.isKnownMissing(project, "m1"));
     }
 
@@ -304,7 +374,7 @@ public class GuardedRoleCachesTests extends ESTestCase {
     }
 
     public void testLeastRecentlyUsedRoleIsEvictedBeyondMaximum() {
-        final GuardedRoleCaches caches = new GuardedRoleCaches(2, UNBOUNDED);
+        final GuardedRoleCaches caches = newCaches(2, UNBOUNDED);
         final ProjectId project = randomUniqueProjectId();
         final SubscribableListener<Role> roleA = cacheRole(caches, project, roleKey("a"), role("a"), Set.of());
         cacheRole(caches, project, roleKey("b"), role("b"), Set.of());
@@ -318,7 +388,7 @@ public class GuardedRoleCachesTests extends ESTestCase {
     }
 
     public void testLeastRecentlyUsedNegativeLookupIsEvictedBeyondMaximum() {
-        final GuardedRoleCaches caches = new GuardedRoleCaches(UNBOUNDED, 2);
+        final GuardedRoleCaches caches = newCaches(UNBOUNDED, 2);
         final ProjectId project = randomUniqueProjectId();
         cacheRole(caches, project, roleKey("a"), role("a"), Set.of("m1"));
         cacheRole(caches, project, roleKey("b"), role("b"), Set.of("m2"));
@@ -332,7 +402,7 @@ public class GuardedRoleCachesTests extends ESTestCase {
     }
 
     public void testZeroMaximumRetainsNothing() {
-        final GuardedRoleCaches caches = new GuardedRoleCaches(0, 0);
+        final GuardedRoleCaches caches = newCaches(0, 0);
         final ProjectId project = randomUniqueProjectId();
         cacheRole(caches, project, R1, role("r1"), Set.of("m1"));
 
@@ -341,7 +411,7 @@ public class GuardedRoleCachesTests extends ESTestCase {
     }
 
     public void testNegativeMaximumMeansNoLimit() {
-        final GuardedRoleCaches caches = new GuardedRoleCaches(UNBOUNDED, UNBOUNDED);
+        final GuardedRoleCaches caches = newCaches(UNBOUNDED, UNBOUNDED);
         final ProjectId project = randomUniqueProjectId();
         final int count = 500;
         for (int i = 0; i < count; i++) {
@@ -359,7 +429,7 @@ public class GuardedRoleCachesTests extends ESTestCase {
      * a write that is rejected or immediately evicted must not leave one behind.
      */
     public void testInternedKeysTrackCachedRoles() {
-        final GuardedRoleCaches bounded = new GuardedRoleCaches(2, UNBOUNDED);
+        final GuardedRoleCaches bounded = newCaches(2, UNBOUNDED);
         final ProjectId project = randomUniqueProjectId();
         final ProjectId otherProject = randomUniqueProjectId();
         for (String name : new String[] { "a", "b", "c" }) {
@@ -382,7 +452,7 @@ public class GuardedRoleCachesTests extends ESTestCase {
         assertFalse(caches.isKnownMissing(project, "missing"));
         assertInternedKeysMatchCachedRoles(caches, 0);
 
-        final GuardedRoleCaches retainsNothing = new GuardedRoleCaches(0, 0);
+        final GuardedRoleCaches retainsNothing = newCaches(0, 0);
         cacheRole(retainsNothing, project, R1, role("r1"), Set.of());
         assertInternedKeysMatchCachedRoles(retainsNothing, 0);
     }
@@ -401,7 +471,7 @@ public class GuardedRoleCachesTests extends ESTestCase {
      * deterministic way to start the read at a precise point of the scan.
      */
     public void testReadWaitsForInvalidationInProgress() throws Exception {
-        final GuardedRoleCaches caches = new GuardedRoleCaches(UNBOUNDED, UNBOUNDED);
+        final GuardedRoleCaches caches = newCaches(UNBOUNDED, UNBOUNDED);
         final ProjectId project = randomUniqueProjectId();
         final RoleKey keyA = roleKey("role-a");
         final RoleKey keyB = roleKey("role-b");
@@ -444,7 +514,7 @@ public class GuardedRoleCachesTests extends ESTestCase {
      * the role {r1} with the missing name m1.
      */
     private static GuardedRoleCaches populatedCaches(ProjectId project, ProjectId otherProject) {
-        final GuardedRoleCaches caches = new GuardedRoleCaches(UNBOUNDED, UNBOUNDED);
+        final GuardedRoleCaches caches = newCaches(UNBOUNDED, UNBOUNDED);
         cacheRole(caches, project, R1, role("r1"), Set.of("m1"));
         cacheRole(caches, project, R1_R2, role("r1", "r2"), Set.of("m2"));
         cacheRole(caches, project, R2, role("r2"), Set.of());
@@ -459,15 +529,17 @@ public class GuardedRoleCachesTests extends ESTestCase {
         Role role,
         Set<String> missing
     ) {
-        return caches.getOrLoadRole(project, key, listener -> listener.onResponse(new RoleLoadResult(role, missing, true)));
+        caches.getOrLoadRole(project, key, listener -> listener.onResponse(new RoleLoadResult(role, missing, true)), ActionListener.noop());
+        return caches.getRole(project, key);
     }
 
     private static PendingRoleLoad startRoleLoad(GuardedRoleCaches caches, ProjectId project, RoleKey key) {
         final AtomicReference<ActionListener<RoleLoadResult>> completion = new AtomicReference<>();
-        final SubscribableListener<Role> listener = caches.getOrLoadRole(project, key, l -> {
+        final SubscribableListener<Role> listener = new SubscribableListener<>();
+        caches.getOrLoadRole(project, key, l -> {
             assertFalse(Thread.holdsLock(caches));
             completion.set(l);
-        });
+        }, listener);
         assertNotNull("a new load must be started", completion.get());
         return new PendingRoleLoad(listener, completion.get());
     }
@@ -480,6 +552,10 @@ public class GuardedRoleCachesTests extends ESTestCase {
         final PlainActionFuture<Role> result = new PlainActionFuture<>();
         listener.addListener(result);
         return result.actionGet();
+    }
+
+    private static GuardedRoleCaches newCaches(int maximumRoles, int maximumNegativeLookups) {
+        return new GuardedRoleCaches(maximumRoles, maximumNegativeLookups, new ThreadContext(Settings.EMPTY));
     }
 
     private static RoleKey roleKey(String... names) {

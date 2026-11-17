@@ -285,7 +285,6 @@ public class IndicesAndAliasesResolverTests extends ESTestCase {
                 new DocumentSubsetBitsetCache(Settings.EMPTY),
                 RESTRICTED_INDICES,
                 EsExecutors.DIRECT_EXECUTOR_SERVICE,
-                EsExecutors.DIRECT_EXECUTOR_SERVICE,
                 rds -> {},
                 List.of()
             )

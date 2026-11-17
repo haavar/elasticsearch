@@ -7,8 +7,11 @@
 package org.elasticsearch.xpack.security.authz.store;
 
 import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.support.ContextPreservingActionListener;
 import org.elasticsearch.action.support.SubscribableListener;
 import org.elasticsearch.cluster.metadata.ProjectId;
+import org.elasticsearch.common.util.concurrent.EsExecutors;
+import org.elasticsearch.common.util.concurrent.ThreadContext;
 import org.elasticsearch.common.util.set.Sets;
 import org.elasticsearch.core.CheckedConsumer;
 import org.elasticsearch.core.Nullable;
@@ -46,6 +49,8 @@ final class GuardedRoleCaches {
     /** Identifies invalidations that overlap a load. */
     private record Generation(long project, long global) {}
 
+    private final ThreadContext threadContext;
+
     /**
      * A cache key that scopes another key to a project.
      */
@@ -82,8 +87,10 @@ final class GuardedRoleCaches {
     /**
      * @param maximumRoles           the maximum number of cached roles, or a negative value for no limit
      * @param maximumNegativeLookups the maximum number of cached negative lookups, or a negative value for no limit
+     * @param threadContext          the request context preserved for each subscriber
      */
-    GuardedRoleCaches(int maximumRoles, int maximumNegativeLookups) {
+    GuardedRoleCaches(int maximumRoles, int maximumNegativeLookups, ThreadContext threadContext) {
+        this.threadContext = Objects.requireNonNull(threadContext);
         this.roles = leastRecentlyUsedMap(maximumRoles, token -> interned.remove(token.key, token));
         this.negativeLookups = leastRecentlyUsedMap(maximumNegativeLookups, key -> {});
     }
@@ -136,8 +143,19 @@ final class GuardedRoleCaches {
         }
     }
 
+    /** Completes cache hits inline and pending loads on their completing thread, preserving the caller's context. */
+    void getOrLoadRole(
+        ProjectId projectId,
+        RoleKey roleKey,
+        CheckedConsumer<ActionListener<RoleLoadResult>, Exception> loader,
+        ActionListener<Role> listener
+    ) {
+        final SubscribableListener<Role> sharedRoleListener = getOrLoadRole(projectId, roleKey, loader);
+        sharedRoleListener.addListener(listener, EsExecutors.DIRECT_EXECUTOR_SERVICE, threadContext);
+    }
+
     /** Shares a cached resolution or starts a load outside the cache monitor. */
-    SubscribableListener<Role> getOrLoadRole(
+    private SubscribableListener<Role> getOrLoadRole(
         ProjectId projectId,
         RoleKey roleKey,
         CheckedConsumer<ActionListener<RoleLoadResult>, Exception> loader
@@ -149,35 +167,41 @@ final class GuardedRoleCaches {
         final ProjectScoped<RoleKey> key = new ProjectScoped<>(projectId, roleKey);
         final SubscribableListener<Role> sharedRoleListener = new SubscribableListener<>();
         final Generation generation;
+        final InternedKey token;
         synchronized (this) {
-            final InternedKey token = interned.computeIfAbsent(key, InternedKey::new);
+            token = interned.computeIfAbsent(key, InternedKey::new);
             final SubscribableListener<Role> current = roles.putIfAbsent(token, sharedRoleListener);
             if (current != null) {
                 return current;
             }
             generation = generation(projectId);
         }
-        final ActionListener<RoleLoadResult> completionListener = ActionListener.wrap(result -> {
-            if (result.cacheable() == false) {
-                removeRole(projectId, roleKey, sharedRoleListener);
-            } else if (result.missingRoles().isEmpty() == false) {
-                putMissingIfCurrent(generation, projectId, result.missingRoles());
-            }
-            sharedRoleListener.onResponse(result.role());
-        }, e -> {
-            removeRole(projectId, roleKey, sharedRoleListener);
-            sharedRoleListener.onFailure(e);
-        });
-        ActionListener.run(completionListener, loader);
+        // Complete in an empty context so subscribers retain only their own request headers.
+        final ActionListener<RoleLoadResult> completionListener = new ContextPreservingActionListener<>(
+            threadContext::newEmptyContext,
+            ActionListener.wrap(result -> {
+                if (result.cacheable() == false) {
+                    removeRole(token, sharedRoleListener);
+                } else if (result.missingRoles().isEmpty() == false) {
+                    putMissingIfCurrent(generation, projectId, result.missingRoles());
+                }
+                sharedRoleListener.onResponse(result.role());
+            }, e -> {
+                removeRole(token, sharedRoleListener);
+                sharedRoleListener.onFailure(e);
+            })
+        );
+        // Stash caller authentication while retaining the project for shared role resolution.
+        try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
+            ActionListener.run(completionListener, loader);
+        }
         return sharedRoleListener;
     }
 
     /** Removes only this resolution, leaving any replacement load intact. */
-    private synchronized void removeRole(ProjectId projectId, RoleKey roleKey, SubscribableListener<Role> expected) {
-        final ProjectScoped<RoleKey> key = new ProjectScoped<>(projectId, roleKey);
-        final InternedKey token = interned.get(key);
-        if (token != null && roles.remove(token, expected)) {
-            interned.remove(key, token);
+    private synchronized void removeRole(InternedKey token, SubscribableListener<Role> expected) {
+        if (roles.remove(token, expected)) {
+            interned.remove(token.key, token);
         }
     }
 

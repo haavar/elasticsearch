@@ -11,7 +11,6 @@ import org.apache.logging.log4j.Logger;
 import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.ActionRunnable;
-import org.elasticsearch.action.support.ContextPreservingActionListener;
 import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.cluster.project.ProjectDeletedListener;
 import org.elasticsearch.cluster.project.ProjectResolver;
@@ -119,7 +118,6 @@ public class CompositeRolesStore {
     private final RestrictedIndices restrictedIndices;
     private final ThreadContext threadContext;
     private final Executor roleBuildingExecutor;
-    private final Executor roleCompletionExecutor;
     private final List<ImplicitPrivilegesProvider> implicitPrivilegesProviders;
     private final boolean dlsFlsEnabled;
 
@@ -137,7 +135,6 @@ public class CompositeRolesStore {
         DocumentSubsetBitsetCache dlsBitsetCache,
         RestrictedIndices restrictedIndices,
         Executor roleBuildingExecutor,
-        Executor roleCompletionExecutor,
         Consumer<Collection<RoleDescriptor>> effectiveRoleDescriptorsConsumer,
         List<ImplicitPrivilegesProvider> implicitPrivilegesProviders
     ) {
@@ -160,7 +157,11 @@ public class CompositeRolesStore {
         this.projectResolver = projectResolver;
         this.dlsBitsetCache = Objects.requireNonNull(dlsBitsetCache);
         this.fieldPermissionsCache = Objects.requireNonNull(fieldPermissionsCache);
-        this.caches = new GuardedRoleCaches(CACHE_SIZE_SETTING.get(settings), NEGATIVE_LOOKUP_CACHE_SIZE_SETTING.get(settings));
+        this.caches = new GuardedRoleCaches(
+            CACHE_SIZE_SETTING.get(settings),
+            NEGATIVE_LOOKUP_CACHE_SIZE_SETTING.get(settings),
+            threadContext
+        );
         this.restrictedIndices = restrictedIndices;
         this.superuserRole = Role.buildFromRoleDescriptor(
             ReservedRolesStore.SUPERUSER_ROLE_DESCRIPTOR,
@@ -193,7 +194,6 @@ public class CompositeRolesStore {
         this.anonymousUser = new AnonymousUser(settings);
         this.threadContext = threadContext;
         this.roleBuildingExecutor = roleBuildingExecutor;
-        this.roleCompletionExecutor = roleCompletionExecutor;
         this.implicitPrivilegesProviders = implicitPrivilegesProviders;
         this.dlsFlsEnabled = XPackSettings.DLS_FLS_ENABLED.get(settings);
     }
@@ -265,16 +265,10 @@ public class CompositeRolesStore {
             return;
         }
 
-        caches.getOrLoadRole(projectId, roleKey, listener -> loadRole(roleReference, projectId, roleKey, listener))
-            .addListener(roleActionListener, roleCompletionExecutor, threadContext);
+        caches.getOrLoadRole(projectId, roleKey, listener -> loadRole(roleReference, projectId, roleKey, listener), roleActionListener);
     }
 
     private void loadRole(RoleReference roleReference, ProjectId projectId, RoleKey roleKey, ActionListener<RoleLoadResult> listener) {
-        // Complete in an empty context so subscribers retain only their own request headers.
-        final ActionListener<RoleLoadResult> completionListener = new ContextPreservingActionListener<>(
-            threadContext::newEmptyContext,
-            listener
-        );
         final Consumer<Exception> failureHandler = e -> {
             // Because superuser does not have write access to restricted indices, it is valid to mix superuser with other roles to
             // gain addition access. However, if retrieving those roles fails for some reason, then that could leave admins in a
@@ -290,33 +284,28 @@ public class CompositeRolesStore {
                     ),
                     e
                 );
-                completionListener.onResponse(new RoleLoadResult(superuserRole, Set.of(), false));
+                listener.onResponse(new RoleLoadResult(superuserRole, Set.of(), false));
             } else {
-                completionListener.onFailure(e);
+                listener.onFailure(e);
             }
         };
-        final ActionListener<RoleLoadResult> loadListener = ActionListener.wrap(completionListener::onResponse, failureHandler);
-        // Stash caller authentication while retaining the project for shared role resolution.
-        try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
-            ActionListener.run(loadListener.<RolesRetrievalResult>delegateFailureAndWrap((delegate, result) -> {
-                if (result == RolesRetrievalResult.EMPTY || result == RolesRetrievalResult.SUPERUSER) {
-                    delegate.onResponse(
-                        new RoleLoadResult(result == RolesRetrievalResult.EMPTY ? Role.EMPTY : superuserRole, Set.of(), false)
-                    );
-                    return;
-                }
+        final ActionListener<RoleLoadResult> loadListener = ActionListener.wrap(listener::onResponse, failureHandler);
+        ActionListener.run(loadListener.<RolesRetrievalResult>delegateFailureAndWrap((delegate, result) -> {
+            if (result == RolesRetrievalResult.EMPTY || result == RolesRetrievalResult.SUPERUSER) {
+                delegate.onResponse(new RoleLoadResult(result == RolesRetrievalResult.EMPTY ? Role.EMPTY : superuserRole, Set.of(), false));
+                return;
+            }
 
-                final ActionRunnable<RoleLoadResult> buildRole = ActionRunnable.wrap(
-                    delegate,
-                    l -> buildRoleFromRetrievalResult(projectId, roleKey, result, l)
-                );
-                if (shouldForkRoleBuilding(result.getRoleDescriptors())) {
-                    roleBuildingExecutor.execute(buildRole);
-                } else {
-                    buildRole.run();
-                }
-            }), l -> roleReference.resolve(roleReferenceResolver, l));
-        }
+            final ActionRunnable<RoleLoadResult> buildRole = ActionRunnable.wrap(
+                delegate,
+                l -> buildRoleFromRetrievalResult(projectId, roleKey, result, l)
+            );
+            if (shouldForkRoleBuilding(result.getRoleDescriptors())) {
+                roleBuildingExecutor.execute(buildRole);
+            } else {
+                buildRole.run();
+            }
+        }), l -> roleReference.resolve(roleReferenceResolver, l));
     }
 
     /**
