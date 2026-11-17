@@ -11,6 +11,7 @@ import org.apache.logging.log4j.Logger;
 import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.ActionRunnable;
+import org.elasticsearch.action.support.ContextPreservingActionListener;
 import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.cluster.project.ProjectDeletedListener;
 import org.elasticsearch.cluster.project.ProjectResolver;
@@ -58,6 +59,7 @@ import org.elasticsearch.xpack.core.security.user.User;
 import org.elasticsearch.xpack.security.authc.ApiKeyService;
 import org.elasticsearch.xpack.security.authc.service.ServiceAccountService;
 import org.elasticsearch.xpack.security.authz.restriction.WorkflowService;
+import org.elasticsearch.xpack.security.authz.store.GuardedRoleCaches.RoleLoadResult;
 import org.elasticsearch.xpack.security.support.SecurityIndexManager;
 
 import java.util.ArrayList;
@@ -117,6 +119,7 @@ public class CompositeRolesStore {
     private final RestrictedIndices restrictedIndices;
     private final ThreadContext threadContext;
     private final Executor roleBuildingExecutor;
+    private final Executor roleCompletionExecutor;
     private final List<ImplicitPrivilegesProvider> implicitPrivilegesProviders;
     private final boolean dlsFlsEnabled;
 
@@ -134,6 +137,7 @@ public class CompositeRolesStore {
         DocumentSubsetBitsetCache dlsBitsetCache,
         RestrictedIndices restrictedIndices,
         Executor roleBuildingExecutor,
+        Executor roleCompletionExecutor,
         Consumer<Collection<RoleDescriptor>> effectiveRoleDescriptorsConsumer,
         List<ImplicitPrivilegesProvider> implicitPrivilegesProviders
     ) {
@@ -189,6 +193,7 @@ public class CompositeRolesStore {
         this.anonymousUser = new AnonymousUser(settings);
         this.threadContext = threadContext;
         this.roleBuildingExecutor = roleBuildingExecutor;
+        this.roleCompletionExecutor = roleCompletionExecutor;
         this.implicitPrivilegesProviders = implicitPrivilegesProviders;
         this.dlsFlsEnabled = XPackSettings.DLS_FLS_ENABLED.get(settings);
     }
@@ -260,68 +265,57 @@ public class CompositeRolesStore {
             return;
         }
 
-        final Role existing = caches.getRole(projectId, roleKey);
-        if (existing == null) {
-            // Captured before any source is consulted (resolving the reference reads the negative-lookup cache), so a resolution
-            // that overlaps an invalidation finds the generation moved when it tries to cache what it built, and skips caching
-            final GuardedRoleCaches.Generation generation = caches.generation(projectId);
-            final Consumer<Exception> failureHandler = e -> {
-                // Because superuser does not have write access to restricted indices, it is valid to mix superuser with other roles to
-                // gain addition access. However, if retrieving those roles fails for some reason, then that could leave admins in a
-                // situation where they are unable to administer their cluster (in order to resolve the problem that is leading to failures
-                // in role retrieval). So if a role reference includes superuser, but role retrieval failed, we fallback to the static
-                // superuser role.
-                if (includesSuperuserRole(roleReference)) {
-                    logger.warn(
-                        () -> format(
-                            "there was a failure resolving the roles [%s], falling back to the [%s] role instead",
-                            roleReference.id(),
-                            Strings.arrayToCommaDelimitedString(superuserRole.names())
-                        ),
-                        e
+        caches.getOrLoadRole(projectId, roleKey, listener -> loadRole(roleReference, projectId, roleKey, listener))
+            .addListener(roleActionListener, roleCompletionExecutor, threadContext);
+    }
+
+    private void loadRole(RoleReference roleReference, ProjectId projectId, RoleKey roleKey, ActionListener<RoleLoadResult> listener) {
+        // Complete in an empty context so subscribers retain only their own request headers.
+        final ActionListener<RoleLoadResult> completionListener = new ContextPreservingActionListener<>(
+            threadContext::newEmptyContext,
+            listener
+        );
+        final Consumer<Exception> failureHandler = e -> {
+            // Because superuser does not have write access to restricted indices, it is valid to mix superuser with other roles to
+            // gain addition access. However, if retrieving those roles fails for some reason, then that could leave admins in a
+            // situation where they are unable to administer their cluster (in order to resolve the problem that is leading to failures
+            // in role retrieval). So if a role reference includes superuser, but role retrieval failed, we fallback to the static
+            // superuser role.
+            if (includesSuperuserRole(roleReference)) {
+                logger.warn(
+                    () -> format(
+                        "there was a failure resolving the roles [%s], falling back to the [%s] role instead",
+                        roleReference.id(),
+                        Strings.arrayToCommaDelimitedString(superuserRole.names())
+                    ),
+                    e
+                );
+                completionListener.onResponse(new RoleLoadResult(superuserRole, Set.of(), false));
+            } else {
+                completionListener.onFailure(e);
+            }
+        };
+        final ActionListener<RoleLoadResult> loadListener = ActionListener.wrap(completionListener::onResponse, failureHandler);
+        // Stash caller authentication while retaining the project for shared role resolution.
+        try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
+            ActionListener.run(loadListener.<RolesRetrievalResult>delegateFailureAndWrap((delegate, result) -> {
+                if (result == RolesRetrievalResult.EMPTY || result == RolesRetrievalResult.SUPERUSER) {
+                    delegate.onResponse(
+                        new RoleLoadResult(result == RolesRetrievalResult.EMPTY ? Role.EMPTY : superuserRole, Set.of(), false)
                     );
-                    roleActionListener.onResponse(superuserRole);
-                } else {
-                    roleActionListener.onFailure(e);
+                    return;
                 }
-            };
-            roleReference.resolve(roleReferenceResolver, ActionListener.wrap(rolesRetrievalResult -> {
-                if (RolesRetrievalResult.EMPTY == rolesRetrievalResult) {
-                    roleActionListener.onResponse(Role.EMPTY);
-                } else if (RolesRetrievalResult.SUPERUSER == rolesRetrievalResult) {
-                    roleActionListener.onResponse(superuserRole);
+
+                final ActionRunnable<RoleLoadResult> buildRole = ActionRunnable.wrap(
+                    delegate,
+                    l -> buildRoleFromRetrievalResult(projectId, roleKey, result, l)
+                );
+                if (shouldForkRoleBuilding(result.getRoleDescriptors())) {
+                    roleBuildingExecutor.execute(buildRole);
                 } else {
-                    final ActionListener<Role> wrapped = ActionListener.wrap(roleActionListener::onResponse, failureHandler);
-                    if (shouldForkRoleBuilding(rolesRetrievalResult.getRoleDescriptors())) {
-                        roleBuildingExecutor.execute(
-                            ActionRunnable.wrap(
-                                wrapped,
-                                l -> buildThenMaybeCacheRole(
-                                    projectId,
-                                    roleKey,
-                                    rolesRetrievalResult.getRoleDescriptors(),
-                                    rolesRetrievalResult.getMissingRoles(),
-                                    rolesRetrievalResult.isSuccess(),
-                                    generation,
-                                    l
-                                )
-                            )
-                        );
-                    } else {
-                        buildThenMaybeCacheRole(
-                            projectId,
-                            roleKey,
-                            rolesRetrievalResult.getRoleDescriptors(),
-                            rolesRetrievalResult.getMissingRoles(),
-                            rolesRetrievalResult.isSuccess(),
-                            generation,
-                            wrapped
-                        );
-                    }
+                    buildRole.run();
                 }
-            }, failureHandler));
-        } else {
-            roleActionListener.onResponse(existing);
+            }), l -> roleReference.resolve(roleReferenceResolver, l));
         }
     }
 
@@ -370,40 +364,26 @@ public class CompositeRolesStore {
         return roleReferenceResolver;
     }
 
-    private void buildThenMaybeCacheRole(
+    private void buildRoleFromRetrievalResult(
         ProjectId projectId,
         RoleKey roleKey,
-        Collection<RoleDescriptor> roleDescriptors,
-        Set<String> missing,
-        boolean tryCache,
-        GuardedRoleCaches.Generation generation,
-        ActionListener<Role> listener
+        RolesRetrievalResult result,
+        ActionListener<RoleLoadResult> listener
     ) {
         logger.trace(
             "Building role from descriptors [{}] for names [{}] from source [{}] in project [{}] on [{}]",
-            roleDescriptors,
+            result.getRoleDescriptors(),
             roleKey.getNames(),
             roleKey.getSource(),
             projectId,
             Thread.currentThread().getName()
         );
         buildRoleFromDescriptors(
-            roleDescriptors,
+            result.getRoleDescriptors(),
             fieldPermissionsCache,
             privilegeStore,
             restrictedIndices,
-            listener.delegateFailureAndWrap((delegate, role) -> {
-                if (role != null && tryCache) {
-                    if (caches.putIfCurrent(generation, projectId, roleKey, role, missing) == false) {
-                        logger.trace(
-                            "not caching role for names [{}] in project [{}] because the caches were invalidated while it was built",
-                            roleKey.getNames(),
-                            projectId
-                        );
-                    }
-                }
-                delegate.onResponse(role);
-            }),
+            listener.map(role -> new RoleLoadResult(role, result.getMissingRoles(), result.isSuccess())),
             implicitPrivilegesProviders,
             dlsFlsEnabled
         );

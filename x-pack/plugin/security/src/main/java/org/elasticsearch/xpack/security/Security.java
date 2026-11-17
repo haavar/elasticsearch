@@ -1151,6 +1151,7 @@ public class Security extends Plugin
             dlsBitsetCache.get(),
             restrictedIndices,
             buildRoleBuildingExecutor(threadPool, settings),
+            threadPool.generic(),
             new DeprecationRoleDescriptorConsumer(clusterService, projectResolver, threadPool),
             implicitPrivilegesProviders
         );

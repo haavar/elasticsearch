@@ -6,9 +6,14 @@
  */
 package org.elasticsearch.xpack.security.authz.store;
 
+import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.support.SubscribableListener;
 import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.common.util.set.Sets;
+import org.elasticsearch.core.CheckedConsumer;
 import org.elasticsearch.core.Nullable;
+import org.elasticsearch.logging.LogManager;
+import org.elasticsearch.logging.Logger;
 import org.elasticsearch.xpack.core.security.authz.permission.Role;
 import org.elasticsearch.xpack.core.security.authz.store.RoleKey;
 
@@ -24,28 +29,22 @@ import java.util.function.Consumer;
 import java.util.function.Predicate;
 
 /**
- * Owns the role cache and the negative-lookup cache of the {@link CompositeRolesStore} and keeps them consistent with the role
- * sources across invalidations.
+ * Owns shared role resolutions and negative lookups for {@link CompositeRolesStore}.
  * <p>
- * Every operation runs under this object's monitor, and nothing expensive runs there: resolving descriptors and building the
- * role happen before {@link #putIfCurrent} is called, and a read hashes and compares the role key, whose cost grows with the
- * number of role names, before taking the monitor. To make that possible, each cached role key is interned to an
- * {@link InternedKey} whose equality is identity, and the role cache is keyed by that token, so a lookup under the monitor costs
- * the same regardless of the size of the key. An invalidation removes the affected entries
- * from both caches and then advances a generation. A resolution captures the generation before it consults any role source, so
- * if it finds the generation unchanged when it offers its result to the cache, no invalidation overlapped it and the result is
- * current. A resolution that did overlap an invalidation finds the generation moved and caches nothing; the next resolution
- * rebuilds the role from the current sources.
+ * Cache access runs under the monitor; role resolution and listener completion run outside it.
+ * Reads hash and compare role keys outside the monitor, then use identity-based {@link InternedKey} tokens inside it.
  * <p>
- * There is one generation per project plus a global one, so an invalidation scoped to one project does not discard the results
- * of resolutions in flight for other projects.
+ * Invalidations remove matching pending and completed roles; generations guard late negative-cache writes per project.
  */
 final class GuardedRoleCaches {
 
-    /**
-     * The state of the caches as observed by a resolution before it consulted any role source. Opaque to callers.
-     */
-    record Generation(long project, long global) {}
+    private static final Logger logger = LogManager.getLogger(GuardedRoleCaches.class);
+
+    /** Carries cache metadata only until the built role is published to subscribers. */
+    record RoleLoadResult(Role role, Set<String> missingRoles, boolean cacheable) {}
+
+    /** Identifies invalidations that overlap a load. */
+    private record Generation(long project, long global) {}
 
     /**
      * A cache key that scopes another key to a project.
@@ -75,7 +74,7 @@ final class GuardedRoleCaches {
     private final ConcurrentHashMap<ProjectScoped<RoleKey>, InternedKey> interned = new ConcurrentHashMap<>();
 
     // All fields below are guarded by this object's monitor
-    private final Map<InternedKey, Role> roles;
+    private final Map<InternedKey, SubscribableListener<Role>> roles;
     private final Map<ProjectScoped<String>, Boolean> negativeLookups;
     private final Map<ProjectId, Long> projectGenerations = new HashMap<>();
     private long globalGeneration;
@@ -126,7 +125,7 @@ final class GuardedRoleCaches {
     }
 
     @Nullable
-    Role getRole(ProjectId projectId, RoleKey roleKey) {
+    SubscribableListener<Role> getRole(ProjectId projectId, RoleKey roleKey) {
         // Hashing and comparing the key happen here, outside the monitor
         final InternedKey token = interned.get(new ProjectScoped<>(projectId, roleKey));
         if (token == null) {
@@ -137,35 +136,75 @@ final class GuardedRoleCaches {
         }
     }
 
+    /** Shares a cached resolution or starts a load outside the cache monitor. */
+    SubscribableListener<Role> getOrLoadRole(
+        ProjectId projectId,
+        RoleKey roleKey,
+        CheckedConsumer<ActionListener<RoleLoadResult>, Exception> loader
+    ) {
+        final SubscribableListener<Role> existing = getRole(projectId, roleKey);
+        if (existing != null) {
+            return existing;
+        }
+        final ProjectScoped<RoleKey> key = new ProjectScoped<>(projectId, roleKey);
+        final SubscribableListener<Role> sharedRoleListener = new SubscribableListener<>();
+        final Generation generation;
+        synchronized (this) {
+            final InternedKey token = interned.computeIfAbsent(key, InternedKey::new);
+            final SubscribableListener<Role> current = roles.putIfAbsent(token, sharedRoleListener);
+            if (current != null) {
+                return current;
+            }
+            generation = generation(projectId);
+        }
+        final ActionListener<RoleLoadResult> completionListener = ActionListener.wrap(result -> {
+            if (result.cacheable() == false) {
+                removeRole(projectId, roleKey, sharedRoleListener);
+            } else if (result.missingRoles().isEmpty() == false) {
+                putMissingIfCurrent(generation, projectId, result.missingRoles());
+            }
+            sharedRoleListener.onResponse(result.role());
+        }, e -> {
+            removeRole(projectId, roleKey, sharedRoleListener);
+            sharedRoleListener.onFailure(e);
+        });
+        ActionListener.run(completionListener, loader);
+        return sharedRoleListener;
+    }
+
+    /** Removes only this resolution, leaving any replacement load intact. */
+    private synchronized void removeRole(ProjectId projectId, RoleKey roleKey, SubscribableListener<Role> expected) {
+        final ProjectScoped<RoleKey> key = new ProjectScoped<>(projectId, roleKey);
+        final InternedKey token = interned.get(key);
+        if (token != null && roles.remove(token, expected)) {
+            interned.remove(key, token);
+        }
+    }
+
     synchronized boolean isKnownMissing(ProjectId projectId, String roleName) {
         // get rather than containsKey so that the lookup counts as an access for eviction purposes
         return negativeLookups.get(new ProjectScoped<>(projectId, roleName)) != null;
     }
 
-    /**
-     * Captures the current generation for the given project. Must be called before the resolution consults any role source,
-     * including the negative-lookup cache, for the check in {@link #putIfCurrent} to be meaningful.
-     */
-    synchronized Generation generation(ProjectId projectId) {
+    /** Captures the generation before any role source is consulted. */
+    private Generation generation(ProjectId projectId) {
+        assert Thread.holdsLock(this);
         return new Generation(projectGenerations.getOrDefault(projectId, 0L), globalGeneration);
     }
 
-    /**
-     * Caches the built role and records the role names that were not found, unless an invalidation has moved the generation
-     * since {@code observed} was captured. If another resolution already cached a role, retains that instance and its warmed caches.
-     *
-     * @return {@code true} if the generation is still current, {@code false} if the entries were discarded because of an invalidation
-     */
-    synchronized boolean putIfCurrent(Generation observed, ProjectId projectId, RoleKey roleKey, Role role, Set<String> missing) {
+    /** Records missing names only if no invalidation has moved the observed generation. */
+    private synchronized void putMissingIfCurrent(Generation observed, ProjectId projectId, Set<String> missing) {
         if (observed.equals(generation(projectId)) == false) {
-            return false;
+            logger.trace(
+                "not caching missing roles [{}] in project [{}] because the caches were invalidated during resolution",
+                missing,
+                projectId
+            );
+            return;
         }
-        // Interned under the monitor so that the table never holds a token that is absent from the role cache
-        roles.putIfAbsent(interned.computeIfAbsent(new ProjectScoped<>(projectId, roleKey), InternedKey::new), role);
         for (String name : missing) {
             negativeLookups.put(new ProjectScoped<>(projectId, name), Boolean.TRUE);
         }
-        return true;
     }
 
     synchronized void invalidateAll() {
@@ -185,8 +224,7 @@ final class GuardedRoleCaches {
         removeRoles(eq(projectId));
         negativeLookups.keySet().removeIf(eq(projectId));
         projectGenerations.remove(projectId);
-        // Resolutions still in flight for the removed project captured a per-project generation that is now forgotten;
-        // advancing the global generation keeps them from repopulating the caches
+        // Prevent old lookups from restoring negative entries after their project generation is forgotten.
         globalGeneration++;
     }
 
